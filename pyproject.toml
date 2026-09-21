@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "marimo_pys"
-version = "0.0.1"
+version = "0.0.1.1"
 description = "PyScript Execution Function in Marimo"
 readme = "README.md"
 authors = [
@@ -30,5 +30,5 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/uniras/pysionui"
-Repository = "https://github.com/uniras/pysionui"
+Homepage = "https://github.com/uniras/marimo-pys"
+Repository = "https://github.com/uniras/marimo-pys"
