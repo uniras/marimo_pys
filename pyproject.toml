@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "marimo_pys"
-version = "0.0.1.2"
+version = "0.0.2"
 description = "Run Python functions as PyScript inside marimo"
 readme = "README.md"
 authors = [

@@ -3,17 +3,17 @@ import textwrap
 import html
 import json
 import base64
-import marimo as mo
+
 from typing import Callable, Optional, Union, Any
 
+import marimo as mo
+from anywidget import AnyWidget
+import traitlets
 
-def run_pyscript(
+
+def __create_html(
     code: Union[Callable, str],
-    width: str = '100%',
-    height: str = '200px',
     body_style: str = '',
-    iframe_style: str = '',
-    iframe_sandbox: str = 'allow-scripts',
     config: Optional[dict[str, Any]] = None,
     data: Optional[dict[str, Any]] = None,
     add_script: Optional[list[str]] = None,
@@ -23,37 +23,7 @@ def run_pyscript(
     terminal: bool = False,
     pys_version: str = '2026.7.3',
     pys_type: str = 'mpy',
-) -> mo.Html:
-    """
-    Generates HTML to execute the specified Python function as a PyScript and returns it as an Marimo iframe.
-
-    Args:
-        code (Union[Callable, str]): The async function or raw source code to be executed.
-            A callable must be a coroutine function; it is awaited in the browser as
-            ``await code(js, data)``, where ``js`` is the PyScript ``js`` module and
-            ``data`` is the ``data`` argument decoded back into a plain Python object.
-            Only the function's own source is transferred: it runs in a fresh
-            interpreter with no access to the surrounding module's imports, globals or
-            closure variables, so every import must happen inside the function body.
-            Decorators are not supported.
-        width (str): Width of the iframe. Default is '100%'.
-        height (str): Height of the iframe. Default is '200px'.
-        body_style (str): Additional CSS styles for the body. Default is ''.
-        iframe_style (str): Additional CSS styles for the iframe. Default is ''.
-        iframe_sandbox (str): Sandbox attributes for the iframe. Default is 'allow-scripts'.
-        config (Optional[dict[str, Any]]): Configuration dictionary for PyScript. Default is None.
-        data (Optional[dict[str, Any]]): Data dictionary to be passed to the function. Default is None.
-        add_script (Optional[list[str]]): List of additional JavaScript files to include. Default is None.
-        add_module (Optional[list[str]]): List of additional JavaScript modules to include. Default is None.
-        add_css (Optional[list[str]]): List of additional CSS files to include. Default is None.
-        add_dangerous_html (str): Additional HTML content to include in the body. note: This can be dangerous if it includes untrusted content. Default is ''.
-        terminal (bool): Whether to enable terminal output in PyScript. Default is False.
-        pys_version (str): Version of PyScript to use. Default is '2026.7.3'.
-        pys_type (str): Type of PyScript to use. Default is 'mpy'.
-
-    Returns:
-        mo.Html: An HTML object containing the iframe with the PyScript execution.
-    """
+) -> str:
 
     # Set default values for optional parameters
     config = config or {}
@@ -71,15 +41,19 @@ def run_pyscript(
 
         # Validate that the function is a coroutine function
         if not inspect.iscoroutinefunction(code):
-          raise TypeError(
-              f"{func_name!r} must be an async function; "
-              f"declare it as 'async def {func_name}(js, data)'."
-          )
+          raise TypeError(f'{func_name!r} must be an async function;\ndeclare it as async def {func_name!r}(js, data).')
 
         # Extract function source code as a string and normalize it by left-justifying it
         clean_source = textwrap.dedent(inspect.getsource(code))
 
-        execute_script = f'{clean_source}\n\n# --- Auto-generated trigger ---\nimport js\nimport json\nawait {func_name}(js, json.loads(js.JSON.stringify(js.globalThis.pys_data)))'
+        execute_script = f'''{clean_source}
+
+import js
+import json
+
+js.window.parent.postMessage('marimo-pys:ready', '*')
+await {func_name}(js, json.loads(js.JSON.stringify(js.globalThis.pys_data)))
+'''
     elif isinstance(code, str):
         # If func is a string, treat it as raw source code
         execute_script = code
@@ -114,7 +88,7 @@ def run_pyscript(
         raise ValueError("Invalid pys_type. Must be one of 'mpy', 'py', or 'py-game'.")
 
     # Assemble the HTML template (CSS {} etc. are doubled for escaping in f-string)
-    html_template = f"""
+    return f'''
 <!DOCTYPE html>
 <html>
 <head>
@@ -152,7 +126,176 @@ def run_pyscript(
   <script type="{pys_type}" config="{config_json}" src="data:text/python;charset=utf-8;base64,{b64_script}"{terminal_attr}></script>
 </body>
 </html>
+    '''
+
+
+
+class PysWidget(AnyWidget):
+    """A PyScript iframe with last-value-wins, bidirectional state sync.
+
+    ``data`` is both the initial run_pyscript() argument and the initial
+    outgoing state. ``set_data()`` updates the latter without reloading the iframe.
+    The browser waits for an automatic ready signal before sending that state.
     """
 
-    # Wrap in an iframe and return
-    return mo.Html(f'<iframe srcdoc="{html.escape(html_template)}" width="{html.escape(width)}" height="{html.escape(height)}" style="{html.escape(iframe_style)}" sandbox="{html.escape(iframe_sandbox)}"></iframe>')
+    _esm = r'''
+function render({ model, el }) {
+  const iframe = document.createElement('iframe');
+  iframe.setAttribute("sandbox", model.get('iframe_sandbox'));
+  iframe.setAttribute("width", model.get('width'));
+  iframe.setAttribute("height", model.get('height'));
+  iframe.setAttribute("style", model.get('iframe_style'));
+
+  let ready = false;
+  let disposed = false;
+
+  function sendLatest() {
+    if (!ready || disposed || !iframe.contentWindow) return;
+    iframe.contentWindow.postMessage({
+      channel: 'marimo-pys',
+      type: 'update',
+      payload: model.get('data'),
+    }, '*');
+  }
+
+  function receive(event) {
+    // Never accept a message from another PysWidget's iframe.
+    if (event.source !== iframe.contentWindow) return;
+    if (event.origin !== window.location.origin && event.origin !== 'null') return;
+
+    if (event.data === 'marimo-pys:ready') {
+      ready = true;
+      sendLatest();
+      return;
+    }
+
+    const message = event.data;
+    if (!message || typeof message !== 'object' ||
+        message.channel !== 'marimo-pys' || message.type !== 'set') return;
+
+    const payload = message.payload;
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return;
+
+    // Keep the synced trait JSON-compatible; reject malformed/non-serializable data.
+    try {
+      const normalized = JSON.parse(JSON.stringify(payload));
+      if (!normalized || Array.isArray(normalized) ||
+          typeof normalized !== 'object') return;
+      model.set('received', normalized);
+      model.save_changes();
+    } catch (error) {
+      console.warn('marimo-pys: rejected message payload', error);
+    }
+  }
+
+  window.addEventListener('message', receive);
+  model.on('change:data', sendLatest);
+  el.appendChild(iframe);
+
+  // Set srcdoc only once: data updates never restart the PyScript runtime.
+  iframe.srcdoc = model.get('srcdoc');
+
+  return () => {
+    disposed = true;
+    window.removeEventListener('message', receive);
+    model.off('change:data', sendLatest);
+    iframe.remove();
+  };
+}
+
+export default { render };
+'''
+
+    srcdoc = traitlets.Unicode('').tag(sync=True)
+    width = traitlets.Unicode('100%').tag(sync=True)
+    height = traitlets.Unicode('200px').tag(sync=True)
+    iframe_style = traitlets.Unicode('').tag(sync=True)
+    iframe_sandbox = traitlets.Unicode('allow-scripts').tag(sync=True)
+    data = traitlets.Dict(default_value={}).tag(sync=True)
+    received = traitlets.Dict(default_value={}).tag(sync=True)
+
+    def __init__(
+        self,
+        html_data: str,
+        width: str,
+        height: str,
+        iframe_style: str,
+        iframe_sandbox: str,
+        data: dict[str, Any]
+    ) -> None:
+        data = data or {}
+        super().__init__(
+            srcdoc=html_data,
+            width=width,
+            height=height,
+            iframe_style=iframe_style,
+            iframe_sandbox=iframe_sandbox,
+            data=data,
+            received={}
+        )
+
+    def set_data(self, data: dict[str, Any]) -> None:
+        """Synchronize the latest state, without waiting for PyScript readiness."""
+        if isinstance(data, dict):
+            self.data = data
+        else:
+            raise('data must be a dictionary.')
+
+
+def run_pyscript(
+    code: Union[Callable, str],
+    width: str = '100%',
+    height: str = '200px',
+    body_style: str = '',
+    iframe_style: str = '',
+    iframe_sandbox: str = 'allow-scripts',
+    config: Optional[dict[str, Any]] = None,
+    data: Optional[dict[str, Any]] = None,
+    add_script: Optional[list[str]] = None,
+    add_module: Optional[list[str]] = None,
+    add_css: Optional[list[str]] = None,
+    add_dangerous_html: str = '',
+    terminal: bool = False,
+    pys_version: str = '2026.7.3',
+    pys_type: str = 'mpy',
+    widget: bool = False
+) -> Union[mo.Html, PysWidget]:
+    """
+    Generates HTML to execute the specified Python function as a PyScript and returns it as an Marimo iframe.
+
+    Args:
+        code (Union[Callable, str]): The async function or raw source code to be executed.
+            A callable must be a coroutine function; it is awaited in the browser as
+            ``await code(js, data)``, where ``js`` is the PyScript ``js`` module and
+            ``data`` is the ``data`` argument decoded back into a plain Python object.
+            Only the function's own source is transferred: it runs in a fresh
+            interpreter with no access to the surrounding module's imports, globals or
+            closure variables, so every import must happen inside the function body.
+            Decorators are not supported.
+        width (str): Width of the iframe. Default is '100%'.
+        height (str): Height of the iframe. Default is '200px'.
+        body_style (str): Additional CSS styles for the body. Default is ''.
+        iframe_style (str): Additional CSS styles for the iframe. Default is ''.
+        iframe_sandbox (str): Sandbox attributes for the iframe. Default is 'allow-scripts'.
+        config (Optional[dict[str, Any]]): Configuration dictionary for PyScript. Default is None.
+        data (Optional[dict[str, Any]]): Data dictionary to be passed to the function. Default is None.
+        add_script (Optional[list[str]]): List of additional JavaScript files to include. Default is None.
+        add_module (Optional[list[str]]): List of additional JavaScript modules to include. Default is None.
+        add_css (Optional[list[str]]): List of additional CSS files to include. Default is None.
+        add_dangerous_html (str): Additional HTML content to include in the body. note: This can be dangerous if it includes untrusted content. Default is ''.
+        terminal (bool): Whether to enable terminal output in PyScript. Default is False.
+        pys_version (str): Version of PyScript to use. Default is '2026.7.3'.
+        pys_type (str): Type of PyScript to use. Default is 'mpy'.
+        widget (bool): Specifies whether to generate a dedicated widget for bidirectional communication; if False, an iframe is generated within mo.Html. Default is False.
+
+    Returns:
+        Union[mo.Html, PysWidget]: An HTML object containing the iframe with the PyScript execution, or a PysWidget if `widget` is True.
+    """
+
+    html_data = __create_html(code, body_style, config, data, add_script, add_module, add_css, add_dangerous_html, terminal, pys_version, pys_type)
+ 
+    if widget:
+        return PysWidget(html_data, width, height, iframe_style, iframe_sandbox, data or {})
+    else:
+        # Wrap in an iframe and return
+        return mo.Html(f'<iframe srcdoc="{html.escape(html_data)}" width="{html.escape(width)}" height="{html.escape(height)}" style="{html.escape(iframe_style)}" sandbox="{html.escape(iframe_sandbox)}"></iframe>')

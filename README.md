@@ -1,250 +1,296 @@
 # marimo-pys
 
-Run Python functions as PyScript inside [marimo](https://marimo.io/).
+Run Python in the browser with [PyScript](https://pyscript.net/) and embed the result in a [marimo](https://marimo.io/) notebook. Use a simple HTML iframe for one-way rendering, or opt into an [AnyWidget](https://anywidget.dev/) for two-way messages between marimo and PyScript.
 
-**marimo-pys** is a lightweight Python package that allows you to execute Python functions in the browser using [PyScript](https://pyscript.net/) and display the results as HTML elements in marimo notebooks.
+**Two display modes:**
 
-Simply define an asynchronous Python function and pass it to `run_pyscript()`. The package handles source code extraction, HTML generation, PyScript initialization, and iframe embedding.
+- `widget=False` (default): returns `marimo.Html` containing a PyScript iframe.
+- `widget=True`: returns a `PysWidget` with synchronized `data` (marimo → PyScript) and `received` (PyScript → marimo) dictionaries.
 
-## Features
+Each iframe runs its own browser-side Python environment. The Python code running in marimo and the Python code running in PyScript do **not** share imports, globals, or memory.
 
-* Execute Python functions in the browser using PyScript.
-* Display HTML content directly in marimo notebooks.
-* Access JavaScript APIs through PyScript's `js` module.
-* Pass JSON-serializable data from marimo to PyScript.
-* Support MicroPython, Pyodide, and PyScript's `py-game` type.
-* Customize iframe dimensions, styles, and sandbox attributes.
-* Include additional JavaScript, JavaScript modules, and CSS.
-* Configure the PyScript runtime and select its version.
-* Work without installing the package by copying its source code into a marimo cell.
-
-## Installation
-
-Install using pip:
+## Install
 
 ```bash
-pip install marimo marimo-pys
+pip install marimo marimo-pys anywidget traitlets
 ```
 
-Or add the package to your project using uv:
+Or with uv:
 
 ```bash
-uv add marimo marimo-pys
+uv add marimo marimo-pys anywidget traitlets
 ```
 
-If marimo is already installed, you only need to install `marimo-pys`.
+The current package imports `marimo`, `anywidget`, and `traitlets`, so make sure all three are installed. PyScript itself is loaded in the browser from `pyscript.net`; the initial page load requires access to those assets.
 
-### Installation without pip or uv
-
-You can also use the package without installing it.
-
-Copy the contents of [`marimo_pys/__init__.py`](https://github.com/uniras/marimo_pys/blob/main/marimo_pys/__init__.py) into a marimo cell.
-
-This makes `run_pyscript()` available directly in your notebook.
-
-## Quick Start
-
-Import `run_pyscript`, define an asynchronous function, and pass it to `run_pyscript()`.
+## Quick start: render HTML
 
 ```python
 from marimo_pys import run_pyscript
 
 async def hello(js, data):
-    element = js.document.createElement("h1")
-    element.textContent = "Hello from PyScript!"
-    js.document.body.appendChild(element)
+    heading = js.document.createElement("h1")
+    heading.textContent = f"Hello, {data['name']}!"
+    js.document.body.appendChild(heading)
 
-run_pyscript(hello)
+run_pyscript(hello, data={"name": "marimo"})
 ```
 
-The function executes inside a PyScript runtime in the browser, and the resulting HTML is displayed in an iframe in your marimo notebook.
+`run_pyscript()` extracts the source of `hello`, loads it into PyScript, and calls it in the browser as `await hello(js, data)`. Here, `js` provides access to JavaScript and browser APIs, while `data` is a JSON-decoded Python dictionary. The function's *return value* is not automatically displayed: create DOM elements or use another browser-side rendering API.
 
-The function must be declared using `async def` and accept two arguments:
+Callable inputs must be defined with `async def` and have source code available to `inspect.getsource()`. Put imports needed by the browser runtime **inside** the callable; its enclosing Python globals and closure are not transferred.
 
-* `js`: The PyScript JavaScript interoperability module.
-* `data`: A Python dictionary containing data passed from marimo.
+## Two-way communication with `widget=True`
 
-The function is invoked automatically as:
-
-```python
-await hello(js, data)
-```
-
-The function's return value is not automatically displayed. Use the DOM APIs or other browser-side rendering mechanisms to produce visible output.
-
-## Usage
-
-### Passing data to PyScript
-
-You can pass data from marimo to your Python function using the `data` argument.
+For a live widget, request `widget=True` and wrap the returned `PysWidget` with marimo's `mo.ui.anywidget()`:
 
 ```python
+import marimo as mo
 from marimo_pys import run_pyscript
 
-async def greeting(js, data):
-    element = js.document.createElement("p")
+async def show_count(js, data):
+    label = js.document.createElement("div")
+    label.textContent = str(data["count"])
+    js.document.body.appendChild(label)
 
-    element.textContent = (
-        f"Hello, {data['name']}! "
-        f"You are {data['age']} years old."
-    )
-
-    js.document.body.appendChild(element)
-
-run_pyscript(
-    greeting,
-    data={
-        "name": "Alice",
-        "age": 25,
-    },
+pys_raw = run_pyscript(
+    show_count,
+    widget=True,
+    data={"count": 50},
 )
+pys = mo.ui.anywidget(pys_raw)
+pys
 ```
 
-The dictionary is serialized to JSON and reconstructed as a Python object inside the PyScript runtime.
+The initial `data={"count": 50}` is passed as the callable's `data` argument. Later calls to `pys_raw.set_data(...)` update the widget's synchronized `data` trait and send an **`update` message** to the running iframe. They do not reassign the callable's original `data` argument or intentionally reload the iframe; your PyScript code must register a message listener if it needs to handle subsequent updates.
 
-Only JSON-serializable values are supported.
+### Message protocol
 
-### Importing Python modules
+The widget uses browser `postMessage` with the following message shapes:
 
-PyScript runs in a separate Python environment from the Python interpreter running marimo.
+**marimo → PyScript:**
 
-Therefore, Python modules imported in marimo are not automatically available inside PyScript.
+```javascript
+{
+  channel: "marimo-pys",
+  type: "update",
+  payload: { count: 75 }
+}
+```
 
-Import the modules you need inside your function.
+**PyScript → marimo:**
+
+```javascript
+{
+  channel: "marimo-pys",
+  type: "set",
+  payload: { count: 76 }
+}
+```
+
+The payload sent to marimo must be a JSON-serializable **object** (a Python dictionary), not a bare number or array. Incoming `set` payloads replace the widget's `received` dictionary; they are not merged with previous payloads. `data` and `received` are separate channels, not one automatically synchronized shared object.
+
+The widget also listens for a string readiness signal, `"marimo-pys:ready"`. For callable inputs, the generated script emits it automatically **just before calling** the async function. Keep the initial value in the callable's `data` argument: the first `update` message may arrive before a listener created inside that function is registered. Once the listener is registered, later updates are received normally. When `code` is a raw source string, no readiness signal is added automatically; see [Raw Python source](#raw-python-source).
+
+### Complete example: a marimo slider and PyScript buttons
+
+The following example lets you move a marimo slider to update the number inside PyScript, or click PyScript's **−** and **+** buttons to update the marimo slider. Put the three Python snippets into **three separate marimo cells**, in order. Keeping widget construction out of cells that read `get_count()` avoids recreating the iframe on every state update.
+
+**Cell 1 — create state and the widget once:**
 
 ```python
+import marimo as mo
 from marimo_pys import run_pyscript
 
-async def show_result(js, data):
-    import math
+async def counter_ui(js, data):
+    import json
+    from pyscript import ffi
 
-    result = math.sqrt(data["number"])
+    count = int(data.get("count", 50))
 
-    element = js.document.createElement("p")
-    element.textContent = f"Square root: {result}"
+    minus = js.document.createElement("button")
+    minus.textContent = "−"
+    label = js.document.createElement("span")
+    label.style.margin = "0 1rem"
+    plus = js.document.createElement("button")
+    plus.textContent = "+"
 
-    js.document.body.appendChild(element)
+    def display_count():
+        label.textContent = str(count)
 
-run_pyscript(
-    show_result,
-    data={"number": 144},
+    def change_by(amount):
+        nonlocal count
+        count = max(0, min(100, count + amount))
+        display_count()
+        js.window.parent.postMessage(
+            ffi.to_js({
+                "channel": "marimo-pys",
+                "type": "set",
+                "payload": {"count": count},
+            }),
+            "*",
+        )
+
+    def receive_update(event):
+        nonlocal count
+        try:
+            message = json.loads(js.JSON.stringify(event.data))
+        except (TypeError, ValueError):
+            return
+        if not isinstance(message, dict):
+            return
+        if message.get("channel") != "marimo-pys" or message.get("type") != "update":
+            return
+        payload = message.get("payload")
+        if not isinstance(payload, dict):
+            return
+        incoming = payload.get("count")
+        if type(incoming) is int and 0 <= incoming <= 100:
+            count = incoming
+            display_count()
+
+    minus.addEventListener("click", ffi.create_proxy(lambda event: change_by(-1)))
+    plus.addEventListener("click", ffi.create_proxy(lambda event: change_by(1)))
+    js.window.addEventListener("message", ffi.create_proxy(receive_update))
+
+    display_count()
+    js.document.body.appendChild(minus)
+    js.document.body.appendChild(label)
+    js.document.body.appendChild(plus)
+
+get_count, set_count = mo.state(50)
+
+pys_raw = run_pyscript(
+    counter_ui,
+    widget=True,
+    data={"count": 50},
+    height="100px",
 )
+pys = mo.ui.anywidget(pys_raw)
+pys
 ```
 
-Additional packages may need to be configured or installed in the selected PyScript runtime.
+**Cell 2 — show the slider and send state changes to the existing iframe:**
 
-### Using Pyodide instead of MicroPython
+```python
+count = get_count()
 
-By default, `run_pyscript()` uses MicroPython.
+# Also handles state changes coming from outside the slider.
+if pys_raw.data.get("count") != count:
+    pys_raw.set_data({"count": count})
 
-To use Pyodide, set `pys_type="py"`.
+def on_slider_change(value):
+    pys_raw.set_data({"count": value})
+    set_count(value)
+
+slider = mo.ui.slider(
+    start=0,
+    stop=100,
+    step=1,
+    value=count,
+    on_change=on_slider_change,
+    label="Count",
+)
+slider
+```
+
+**Cell 3 — reflect messages from the PyScript buttons in marimo state:**
+
+```python
+incoming = pys.received.get("count")
+if type(incoming) is int and 0 <= incoming <= 100:
+    set_count(incoming)
+```
+
+Use `pys.received` in a reactive marimo cell to process incoming messages. The underlying `PysWidget` also exposes a traitlets `received` trait, but the marimo-facing reactive property is a straightforward integration path. This example deliberately separates **initialization**, **marimo → PyScript**, and **PyScript → marimo** to avoid a circular cell dependency or an unnecessary PyScript restart.
+
+For a direct Python-side check without a slider, you can also call:
+
+```python
+pys_raw.set_data({"count": 25})
+```
+
+Run that statement in a separate cell or a callback; don't put a top-level `set_data()` call in a cell that re-runs for unrelated reasons.
+
+## Other usage
+
+### Choose MicroPython or Pyodide
+
+The default PyScript type is MicroPython (`"mpy"`). Use `"py"` for Pyodide or `"py-game"` for PyScript's game-oriented script type:
+
+```python
+run_pyscript(hello, data={"name": "Pyodide"}, pys_type="py")
+```
+
+Python package availability differs between MicroPython and Pyodide. See [PyScript's package configuration guide](https://docs.pyscript.net/2026.7.3/user-guide/configuration/).
+
+### Customize the iframe and runtime
 
 ```python
 run_pyscript(
     hello,
-    pys_type="py",
-)
-```
-
-Supported PyScript types:
-
-| Type      | Description                          |
-| --------- | ------------------------------------ |
-| `mpy`     | MicroPython (default)                |
-| `py`      | Pyodide                              |
-| `py-game` | PyScript's game-oriented script type |
-
-### Customizing the iframe
-
-You can customize the iframe dimensions and CSS styles.
-
-```python
-run_pyscript(
-    hello,
+    data={"name": "custom view"},
     width="100%",
-    height="400px",
-    body_style="background: #222; color: white;",
-    iframe_style="border: 1px solid #555; border-radius: 8px;",
-)
-```
-
-The default iframe dimensions are `100%` width and `200px` height.
-
-### Including external resources
-
-Additional JavaScript files, JavaScript modules, and CSS stylesheets can be included in the generated HTML.
-
-```python
-run_pyscript(
-    hello,
-    add_script=[
-        "https://example.com/example.js",
-    ],
-    add_module=[
-        "https://example.com/example-module.js",
-    ],
-    add_css=[
-        "https://example.com/example.css",
-    ],
-)
-```
-
-These resources are loaded inside the generated iframe.
-
-Replace the example URLs with the actual resources required by your application.
-
-### Configuring PyScript
-
-Use the `config` argument to provide a PyScript configuration dictionary.
-
-```python
-run_pyscript(
-    hello,
-    config={
-        "packages": [
-            "numpy",
-        ],
-    },
-    pys_type="py",
-)
-```
-
-The configuration is passed to PyScript as JSON.
-
-Available configuration options and package support depend on the selected PyScript runtime.
-
-### Enabling terminal output
-
-Enable PyScript's terminal output using the `terminal` argument.
-
-```python
-run_pyscript(
-    hello,
+    height="320px",
+    body_style="background: #20242a; color: white; padding: 12px;",
+    iframe_style="border: 1px solid #777; border-radius: 8px;",
     terminal=True,
+    pys_version="2026.7.3",
 )
 ```
 
-### Executing raw Python source code
+Use `config` for PyScript settings, and `add_script`, `add_module`, or `add_css` to include additional resources *inside the iframe*:
 
-In addition to Python functions, `run_pyscript()` accepts a string containing Python source code.
+```python
+run_pyscript(
+    hello,
+    data={"name": "NumPy"},
+    pys_type="py",
+    config={"packages": ["numpy"]},
+    add_css=["https://example.com/styles.css"],
+)
+```
+
+Replace example URLs with real, trusted resources. Extra Python packages must be compatible with your selected browser-side interpreter.
+
+### Raw Python source
+
+`code` may also be a string instead of an async callable. The source is executed as provided; marimo-pys does **not** automatically invoke a function or add a readiness message in this mode.
 
 ```python
 run_pyscript(
     """
 import js
 
-element = js.document.createElement("p")
-element.textContent = "Executed from a source string!"
-js.document.body.appendChild(element)
+message = js.document.createElement("p")
+message.textContent = "Hello from raw PyScript source!"
+js.document.body.appendChild(message)
 """
 )
 ```
 
-When a string is provided, it is executed as raw source code without automatic function invocation.
+If you use raw source with `widget=True` and want `set_data()` updates, register your `message` listener first, then signal readiness yourself:
 
-## API Reference
+```python
+# Inside the raw PyScript source, after registering the listener:
+js.window.parent.postMessage("marimo-pys:ready", "*")
+```
 
-### `run_pyscript()`
+### HTML inserted before execution
+
+`add_dangerous_html` inserts the supplied HTML directly into the iframe body, without sanitization. Use only trusted content:
+
+```python
+run_pyscript(
+    hello,
+    data={"name": "marimo"},
+    add_dangerous_html='<div id="app"></div>',
+)
+```
+
+## API reference
+
+### `run_pyscript(...)`
 
 ```python
 run_pyscript(
@@ -263,146 +309,67 @@ run_pyscript(
     terminal=False,
     pys_version="2026.7.3",
     pys_type="mpy",
+    widget=False,
 )
 ```
 
-**Parameters**
+| Parameter | Meaning |
+| --- | --- |
+| `code` | Async callable or raw Python source string. |
+| `width`, `height` | iframe dimensions; defaults: `"100%"`, `"200px"`. |
+| `body_style` | Extra CSS declarations for the iframe document's `<body>`. |
+| `iframe_style` | Extra CSS declarations for the iframe element. |
+| `iframe_sandbox` | iframe sandbox tokens; default: `"allow-scripts"`. |
+| `config` | PyScript configuration dictionary. |
+| `data` | JSON-serializable dictionary passed initially to the callable; also the widget's initial outgoing state. |
+| `add_script` | URLs of extra classic JavaScript scripts. |
+| `add_module` | URLs of extra JavaScript modules. |
+| `add_css` | URLs of extra CSS stylesheets. |
+| `add_dangerous_html` | Unsanitized HTML inserted into the iframe body. |
+| `terminal` | Add the PyScript `terminal` attribute; default: `False`. |
+| `pys_version` | PyScript release to load; default: `"2026.7.3"`. |
+| `pys_type` | `"mpy"` (default), `"py"`, or `"py-game"`. |
+| `widget` | Return `PysWidget` when `True`; otherwise return `marimo.Html` (default). |
 
-| Parameter            | Description                                                                |
-| -------------------- | -------------------------------------------------------------------------- |
-| `code`               | An asynchronous Python function or a string containing Python source code. |
-| `width`              | Width of the iframe. Default: `"100%"`.                                    |
-| `height`             | Height of the iframe. Default: `"200px"`.                                  |
-| `body_style`         | Additional CSS styles for the HTML body.                                   |
-| `iframe_style`       | Additional CSS styles for the iframe.                                      |
-| `iframe_sandbox`     | Sandbox attributes for the iframe. Default: `"allow-scripts"`.             |
-| `config`             | PyScript configuration dictionary.                                         |
-| `data`               | Dictionary containing data to pass to the Python function.                 |
-| `add_script`         | List of additional JavaScript file URLs.                                   |
-| `add_module`         | List of additional JavaScript module URLs.                                 |
-| `add_css`            | List of additional CSS file URLs.                                          |
-| `add_dangerous_html` | Additional raw HTML inserted into the iframe body.                         |
-| `terminal`           | Enable PyScript terminal output. Default: `False`.                         |
-| `pys_version`        | PyScript release version. Default: `"2026.7.3"`.                           |
-| `pys_type`           | PyScript type: `"mpy"`, `"py"`, or `"py-game"`.                            |
+### `PysWidget`
 
-**Returns**
+Returned by `run_pyscript(..., widget=True)`.
 
-`marimo.Html`
+| Member | Meaning |
+| --- | --- |
+| `set_data(mapping)` | Replace outgoing `data` with a dictionary; the iframe receives the latest value after its ready signal. |
+| `data` | Synchronized outgoing dictionary. |
+| `received` | Synchronized dictionary last received from a PyScript `set` message. |
+| `srcdoc` | Generated HTML document loaded into the iframe. |
+| `width`, `height`, `iframe_style`, `iframe_sandbox` | Synchronized iframe attributes read when its view is rendered. |
 
-An HTML object containing an iframe with the generated PyScript execution environment.
+`set_data()` replaces the whole dictionary; it does not merge individual keys or await a reply. Multiple updates before readiness are represented by the latest `data` value. When changing `srcdoc` or the iframe's creation-time attributes, do not assume an existing view will automatically rebuild: the view reads them on initial render.
 
-## How It Works
+## How it works
 
-When you pass a Python function to `run_pyscript()`, the package performs the following operations:
+1. For async callables, extract and dedent the function source, then append an invocation with the JSON-decoded initial `data`.
+2. Encode the Python source as Base64 and include it in a generated PyScript HTML document.
+3. Load the HTML through an iframe's `srcdoc` attribute.
+4. In widget mode, use AnyWidget's synchronized traits and per-iframe `postMessage` handling to exchange dictionaries without deliberately reloading the iframe for ordinary `data` changes.
+5. Check each incoming message's `event.source` against the specific iframe window so multiple widgets do not consume one another's messages. The implementation accepts the parent origin or `"null"` for sandboxed iframe messages.
 
-1. Extracts the function's source code using `inspect.getsource()`.
-2. Normalizes indentation using `textwrap.dedent()`.
-3. Appends an automatically generated script that invokes the asynchronous function.
-4. Encodes the resulting Python source code in Base64.
-5. Generates an HTML document containing the PyScript runtime and encoded source code.
-6. Embeds the document into an iframe using `srcdoc`.
-7. Returns the iframe as a `marimo.Html` object.
+PyScript's URL resolution inside `about:srcdoc` needs a compatibility workaround: marimo-pys patches the iframe's `URL` constructor to use the selected PyScript release URL as a fallback for empty or `about:` base URLs. This behavior was written for PyScript `2026.7.3`; recheck it when upgrading PyScript.
 
-The Python function executes in the browser-side PyScript runtime, not in marimo's Python interpreter.
+## Limitations and security
 
-### Why the URL monkey patch is necessary
-
-PyScript uses polyscript internally to resolve relative URLs.
-
-When PyScript is embedded inside an iframe using `srcdoc`, the iframe's `location.href` is `about:srcdoc`.
-
-This can cause polyscript's relative URL resolution to fail during initialization because `about:srcdoc` cannot be used as the base URL for resolving ordinary relative resource paths.
-
-To work around this issue, marimo-pys patches the JavaScript `URL` class before loading PyScript's `core.js`.
-
-The patch replaces empty or `about:` base URLs with the PyScript release URL.
-
-A simplified version of the implementation:
-
-```javascript
-const NativeURL = window.URL;
-
-class PatchedURL extends NativeURL {
-  constructor(url, base) {
-    const b = base == null ? '' : String(base);
-
-    if (b === '' || b.startsWith('about:')) {
-      base = 'https://pyscript.net/releases/2026.7.3/';
-    }
-
-    super(url, base);
-  }
-}
-
-window.URL = PatchedURL;
-```
-
-This workaround has been verified against PyScript `2026.7.3`.
-
-Because it modifies the global `URL` constructor inside the iframe, it may also affect other code that creates URLs in that environment.
-
-The workaround may need to be reviewed or removed when upgrading PyScript.
-
-## Limitations and Considerations
-
-### Separate execution environments
-
-marimo and PyScript use separate Python environments.
-
-The function's source code is transferred to PyScript, but its surrounding module, global variables, imported modules, and closure variables are not transferred automatically.
-
-Use the `data` argument to pass values explicitly.
-
-### Asynchronous functions are required
-
-When passing a callable, it must be a coroutine function defined using `async def`.
-
-Regular synchronous functions are not supported as callable inputs.
-
-Raw source code strings are handled separately and do not have this requirement.
-
-### Source code must be available
-
-The package uses `inspect.getsource()` to extract the function's source code.
-
-Functions whose source code cannot be retrieved may not work.
-
-Decorated functions are not supported.
-
-### iframe isolation
-
-PyScript executes inside a sandboxed iframe.
-
-The default sandbox setting is:
-
-```text
-allow-scripts
-```
-
-This allows script execution while maintaining iframe sandbox restrictions.
-
-Access to the parent document and other browser capabilities may be restricted by the sandbox configuration.
-
-Changing `iframe_sandbox` can affect the security and isolation of the embedded content.
-
-### Raw HTML and external resources
-
-The `add_dangerous_html` parameter inserts raw HTML without sanitization.
-
-Only provide trusted HTML content.
-
-Similarly, additional JavaScript and CSS resources should come from trusted sources.
-
-### PyScript compatibility
-
-The URL resolution workaround is designed for the PyScript version used by this package.
-
-When changing `pys_version`, verify that PyScript initializes and executes correctly.
+- **Browser-side isolation:** The callable's imports, module globals, and closure are not copied to PyScript. The browser must be able to load PyScript and any extra resources.
+- **Source extraction:** `inspect.getsource()` must be able to find the callable's source. Decorated functions and dynamically created functions are not supported as documented callable inputs.
+- **JSON messages only:** Use JSON-serializable dictionaries for `data`, `set_data()`, and inbound `set` payloads. The widget stores only the most recent inbound payload; it is not an event queue.
+- **Iframe lifecycle:** If marimo recreates the widget/view, its iframe and browser-side Python runtime start again. Keep the widget construction cell independent of rapidly changing state.
+- **Sandbox and browser storage:** The default `iframe_sandbox="allow-scripts"` gives the iframe an opaque origin and may block IndexedDB or other storage APIs. You might see a browser-console `SecurityError` even when your PyScript code runs.
+- **`allow-same-origin` is a security trade-off:** `iframe_sandbox="allow-scripts allow-same-origin"` may permit origin-dependent APIs, but with `srcdoc` it makes the iframe same-origin with its parent. Scripts may then access the parent page and potentially remove the sandbox. Use this combination only with code you fully trust; see [MDN's iframe security warning](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/iframe#sandbox).
+- **Trusted content:** `add_dangerous_html` is not sanitized, and external scripts run inside the iframe. Do not use untrusted HTML or JavaScript. The `postMessage` protocol is a data exchange mechanism, **not** a security boundary.
+- **Readiness timing:** For callable inputs, the automatically generated ready message is sent before the user function runs. Use its initial `data` argument for the first render, and install your listener to receive subsequent `update` messages.
 
 ## Links
 
-* [PyPI — marimo-pys](https://pypi.org/project/marimo-pys/)
-* [GitHub — marimo-pys](https://github.com/uniras/marimo_pys)
-* [marimo Documentation](https://docs.marimo.io/)
-* [PyScript Documentation](https://docs.pyscript.net/)
+- [GitHub repository](https://github.com/uniras/marimo_pys)
+- [PyPI package](https://pypi.org/project/marimo-pys/)
+- [marimo documentation](https://docs.marimo.io/)
+- [PyScript documentation](https://docs.pyscript.net/2026.7.3/)
+- [AnyWidget documentation](https://anywidget.dev/)
